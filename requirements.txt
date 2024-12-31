@@ -1,0 +1,14 @@
+fastapi[standard]
+alembic
+asyncpg
+sqlmodel
+uvicorn
+greenlet
+redis
+pyjwt
+python3-saml
+itsdangerous
+python-multipart
+requests
+httpx
+python-dotenv
