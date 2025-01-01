@@ -106,35 +106,85 @@ def create_token(sub:str, session_index: str, token_type: str = "access"):
     }
     return jwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
-async def create_user_mapper(user_id, email, dev_role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None,):
-    """Create a new user mapping"""
+
+async def create_user_mapper(user_id, email, role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None, invitation_token:str=None):
+    """Handle user mapping for both new and invited users"""
     try:
-        statement = select(UserMapper).where(
-            UserMapper.user_uid == user_id,
-            UserMapper.group_id == group_id
-        )
-        result = await session.exec(statement)
-        existing_user = result.first()
-        
-        if existing_user:
-            print(f"User already exists in project {group_name} with role {existing_user.role_id}")
-            raise Exception(f"User already exists in project {group_name} with role {existing_user.role_id}")
-        user_mapper = UserMapper(
-            user_uid=user_id,
-            role_id=dev_role_id,
-            group_id=group_id,
-            project_name=group_name,
-            username=email,
-            email=email,
-            first_name=first_name,
-            last_name=last_name
-        )
-        session.add(user_mapper)
-        await session.commit()
-        return user_mapper
+        if invitation_token:
+            # Check if user exists in the specific project they're invited to
+            statement = select(UserMapper).where(
+                UserMapper.user_uid == user_id,
+                UserMapper.group_id == group_id
+            )
+            result = await session.exec(statement)
+            existing_project_user = result.first()
+            
+            if existing_project_user:
+                return {
+                    "exists": True,
+                    "in_project": True,
+                    "message": f"User already exists in project {group_name} with role {existing_project_user.role_id}"
+                }
+            
+            # User exists but not in this project - add them with invited role
+            user_mapper = UserMapper(
+                user_uid=user_id,
+                role_id=role_id,  # Role from invitation
+                group_id=group_id,
+                project_name=group_name,
+                username=email,
+                email=email,
+                first_name=first_name,
+                last_name=last_name
+            )
+            session.add(user_mapper)
+            await session.commit()
+            
+            return {
+                "exists": True,
+                "in_project": False,
+                "new_project_added": True,
+                "user_data": user_mapper
+            }
+            
+        else:
+            # First time user - check if they exist in any project
+            statement = select(UserMapper).where(UserMapper.user_uid == user_id)
+            result = await session.exec(statement)
+            existing_user = result.first()
+            
+            if existing_user:
+                return {
+                    "exists": True,
+                    "in_project": True,
+                    "user_data": existing_user
+                }
+                
+            # Completely new user - create with owner role in their first project
+            user_mapper = UserMapper(
+                user_uid=user_id,
+                role_id=role_id,  # Owner role for first-time users
+                group_id=group_id,
+                project_name=group_name,
+                username=email,
+                email=email,
+                first_name=first_name,
+                last_name=last_name
+            )
+            session.add(user_mapper)
+            await session.commit()
+            
+            return {
+                "exists": False,
+                "in_project": True,
+                "user_data": user_mapper
+            }
+            
     except Exception as e:
         session.rollback()
-        raise Exception(f"Failed to create user: {str(e)}")
+        raise Exception(f"Failed to process user: {str(e)}")
+
+
     
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
@@ -326,27 +376,21 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
         last_name = attributes["urn:oid:2.5.4.4"][0]    # surname
         
         if invitation_token:
-            # make api call to get the user details like which project they belong to and what is the role of the user
-            print("MAKE API CALL TO GET THE USER DETAILS")
+            # Get project and role details from invitation token
+            # project_details = await validate_invitation_token(invitation_token)
+            # if invitation_token is not valid, raise an error and redirect to the frontend
             role_id = "c378f016-62d1-42a9-8eaf-c53750f29ef8"
             group_id = "c378f016-62d1-42a9-8eaf-c53750f29ef7"
             group_name = "project-2"
-            first_name = "John"
-            last_name = "Doe"
-            
-            await create_user_mapper(user_id, name_id, role_id, group_id, group_name, session, first_name, last_name)
         else:
-            print("*********** NO INVITATION TOKEN ***********")
-            # Initialize Keycloak admin
+            # First time user setup with owner role
             keycloak_admin_token = await get_cached_admin_token()
-            
             group_name = f"{name_id.split('@')[0]}-group"
             group_id = await get_groups_or_create_groups(keycloak_admin_token, group_name)
-            
             # Add user to group
             await add_user_to_group(keycloak_admin_token, user_id, group_id)
             
-            # # Get dev role
+            # Get dev role (It will be owner)
             roles = await get_roles(keycloak_admin_token, 'dev')
             if not roles:
                 raise HTTPException(
@@ -356,8 +400,21 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
             role_id = roles.get('id')
             
             await assign_realm_role_to_user(keycloak_admin_token, user_id, role_id, 'dev')
-            
-            await create_user_mapper(user_id, name_id, role_id, group_id, group_name, session, first_name, last_name)
+        
+        # Create or verify user mapping
+        user_result = await create_user_mapper(
+            user_id=user_id,
+            email=name_id,
+            role_id=role_id,
+            group_id=group_id,
+            group_name=group_name,
+            session=session,
+            first_name=first_name,
+            last_name=last_name,
+            invitation_token=invitation_token
+        )
+        
+        print(f"******* User Result: {user_result} *******")
 
         # Generate temporary code
         temp_code = secrets.token_urlsafe(32)
