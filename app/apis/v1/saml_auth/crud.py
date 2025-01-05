@@ -186,7 +186,7 @@ async def create_user_mapper(user_id, email, role_id, group_id, group_name, sess
 
 
     
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: AsyncSession = Depends(get_session)) -> dict:
     """
     Validate JWT token and return current user data from Redis session
     """
@@ -199,15 +199,46 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             algorithms=["HS256"]
         )
         
-        # Get session data from Redis
-        session_data_str = redis_client.get(f"saml_session:{payload['session_index']}")
-        if not session_data_str:
+        email = payload.get("sub")
+        session_index = payload.get("session_index")
+
+        # First try Redis cache
+        session_data_str = redis_client.get(f"saml_session:{session_index}")
+        if session_data_str:
+            return json.loads(session_data_str)
+            
+        # If not in Redis, check database
+        statement = select(UserMapper).where(UserMapper.email == email)
+        result = await session.exec(statement)
+        user = result.first()
+        
+        if not user:
             raise HTTPException(
                 status_code=401,
-                detail="Session expired"
+                detail="User not found"
             )
-            
-        session_data = json.loads(session_data_str)
+
+        # Get user roles
+        admin_token = await get_cached_admin_token()
+        roles = await get_composite_roles(admin_token, 'dev')
+
+        # Create new session data
+        session_data = {
+            "name_id": email,
+            "email": email,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "roles": roles,
+            "session_index": session_index
+        }
+
+        # Store back in Redis for future requests
+        redis_client.setex(
+            f"saml_session:{session_index}",
+            60 * 60 * 24 * 30,  # 30 days
+            json.dumps(session_data)
+        )
+
         return session_data
         
     except jwt.ExpiredSignatureError:
@@ -233,8 +264,6 @@ async def get_cached_admin_token() -> Optional[str]:
     try:
         # Try to get cached token and its expiration
         cached_data = redis_client.get("keycloak_admin_token")
-        
-        print(f"******* Cached Data: {cached_data} *******")
         
         if cached_data:
             cached_data = json.loads(cached_data)
@@ -574,8 +603,12 @@ async def me(current_user: dict):
         
 async def logout_user(request: Request, current_user: dict):
     try:
+        print(f"******* JUST LOGOUT CALLED *******")
+        print(f"******* Current User: {current_user} *******")
         name_id = current_user.get("name_id")
         session_index = current_user.get("session_index")
+        print(f"******* Name ID: {name_id} *******")
+        print(f"******* Session Index: {session_index} *******")
         
         if not name_id or not session_index:
             return JSONResponse(

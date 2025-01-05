@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 from sqlmodel import SQLModel
 from app.apis.v1.oidc_auth.models import UserMapper
+from app.apis.v1.saml_auth.models import Role, Project, UserRoleProject
 from app.core.config import Config
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

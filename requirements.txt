@@ -2,6 +2,7 @@ fastapi[standard]
 alembic
 asyncpg
 sqlmodel
+pydantic-settings
 uvicorn
 greenlet
 redis
