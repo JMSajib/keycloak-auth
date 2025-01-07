@@ -1,8 +1,8 @@
-import secrets
-from app.apis.v1.oidc_auth.models import UserMapper
+import random, secrets,uuid
+from app.apis.v1.saml_auth.models import UserMapper, Role, Project, UserRoleProject, BlackListedToken
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
-from fastapi import HTTPException, Depends, Request, status
+from fastapi import HTTPException, Depends, Request, status, Header
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import RedirectResponse, JSONResponse
 from app.core.redis_client import redis_client
@@ -107,82 +107,131 @@ def create_token(sub:str, session_index: str, token_type: str = "access"):
     return jwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
-async def create_user_mapper(user_id, email, role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None, invitation_token:str=None):
+async def get_refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = jwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
+    return {
+        "token": token,
+        "sub": payload.get("sub"),
+        "session_index": payload.get("session_index")
+    }
+
+async def add_to_blacklist(token: str, session: AsyncSession) -> None:
+    """Add a token to the blacklist"""
+    try:
+        blacklisted_token = BlackListedToken(token=token)
+        session.add(blacklisted_token)
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        print(f"Error blacklisting token: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to blacklist token: {e}"
+        )
+
+async def is_token_blacklisted(token: str, session: AsyncSession) -> bool:
+    """Check if a token is blacklisted"""
+    try:
+        statement = select(BlackListedToken).where(BlackListedToken.token == token)
+        result = await session.exec(statement)
+        return bool(result.first())
+    except Exception as e:
+        print(f"Error checking blacklist: {e}")
+        return False
+
+async def create_user_mapper(user_keycloak_uid, email, role_keycloak_uid, group_keycloak_uid, group_name, session: AsyncSession, first_name:str=None, last_name:str=None, invitation_token:str=None):
     """Handle user mapping for both new and invited users"""
     try:
-        if invitation_token:
-            # Check if user exists in the specific project they're invited to
-            statement = select(UserMapper).where(
-                UserMapper.user_uid == user_id,
-                UserMapper.group_id == group_id
-            )
-            result = await session.exec(statement)
-            existing_project_user = result.first()
-            
-            if existing_project_user:
-                return {
-                    "exists": True,
-                    "in_project": True,
-                    "message": f"User already exists in project {group_name} with role {existing_project_user.role_id}"
-                }
-            
-            # User exists but not in this project - add them with invited role
-            user_mapper = UserMapper(
-                user_uid=user_id,
-                role_id=role_id,  # Role from invitation
-                group_id=group_id,
-                project_name=group_name,
+        # Convert strings to UUID
+        user_uid = uuid.UUID(user_keycloak_uid)
+        project_uid = uuid.UUID(group_keycloak_uid)
+        role_uid = uuid.UUID(role_keycloak_uid)
+        
+        # 1. Get or create user
+        user_stmt = select(UserMapper).where(UserMapper.user_keycloak_uid == user_uid)
+        result = await session.exec(user_stmt)
+        user = result.first()
+        
+        if not user:
+            user = UserMapper(
+                user_core_id=random.randint(1, 1000000),
+                user_keycloak_uid=user_uid,
                 username=email,
                 email=email,
                 first_name=first_name,
                 last_name=last_name
             )
-            session.add(user_mapper)
-            await session.commit()
+            session.add(user)
+            await session.flush()  # Just flush to get the ID
             
-            return {
-                "exists": True,
-                "in_project": False,
-                "new_project_added": True,
-                "user_data": user_mapper
-            }
-            
-        else:
-            # First time user - check if they exist in any project
-            statement = select(UserMapper).where(UserMapper.user_uid == user_id)
-            result = await session.exec(statement)
-            existing_user = result.first()
-            
-            if existing_user:
-                return {
-                    "exists": True,
-                    "in_project": True,
-                    "user_data": existing_user
-                }
-                
-            # Completely new user - create with owner role in their first project
-            user_mapper = UserMapper(
-                user_uid=user_id,
-                role_id=role_id,  # Owner role for first-time users
-                group_id=group_id,
-                project_name=group_name,
-                username=email,
-                email=email,
-                first_name=first_name,
-                last_name=last_name
+        # 2. Get or create project
+        project_stmt = select(Project).where(Project.project_keycloak_uid == project_uid)
+        result = await session.exec(project_stmt)
+        project = result.first()
+        
+        if not project:
+            project = Project(
+                project_keycloak_uid=project_uid,
+                project_name=group_name
             )
-            session.add(user_mapper)
-            await session.commit()
+            session.add(project)
+            await session.flush()  # Just flush to get the ID
             
+        # 3. Get role
+        role_stmt = select(Role).where(Role.role_keycloak_uid == role_uid)
+        result = await session.exec(role_stmt)
+        role = result.first()
+        
+        if not role:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Role with keycloak_uid {role_keycloak_uid} not found"
+            )
+            
+        # 4. Check if user-role-project mapping exists
+        mapping_stmt = select(UserRoleProject).where(
+            UserRoleProject.user_id == user.id,
+            UserRoleProject.project_id == project.id
+        )
+        result = await session.exec(mapping_stmt)
+        existing_mapping = result.first()
+        
+        if existing_mapping:
+            # User already has a role in this project
             return {
-                "exists": False,
-                "in_project": True,
-                "user_data": user_mapper
+                "status": "exists",
+                "message": f"User already has role {existing_mapping.role_id} in project {project.project_name}"
             }
+        
+        # 5. Create new user-role-project mapping
+        new_mapping = UserRoleProject(
+            user_id=user.id,
+            role_id=role.id,
+            project_id=project.id
+        )
+        session.add(new_mapping)
+        
+        # Only commit once at the end
+        await session.commit()
+        
+        return {
+            "status": "success",
+            "message": "User role mapping created successfully",
+            "data": {
+                "user_id": user.id,
+                "project_id": project.id,
+                "role_id": role.id
+            }
+        }
             
     except Exception as e:
-        session.rollback()
-        raise Exception(f"Failed to process user: {str(e)}")
+        await session.rollback()
+        print(f"Error in create_user_mapper: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process user: {str(e)}"
+        )
 
 
     
@@ -220,7 +269,8 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 
         # Get user roles
         admin_token = await get_cached_admin_token()
-        roles = await get_composite_roles(admin_token, 'dev')
+        roles = await get_composite_roles(admin_token, 'owner')
+        print(f"********** ME {roles} *********")
 
         # Create new session data
         session_data = {
@@ -419,23 +469,23 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
             # Add user to group
             await add_user_to_group(keycloak_admin_token, user_id, group_id)
             
-            # Get dev role (It will be owner)
-            roles = await get_roles(keycloak_admin_token, 'dev')
+            # (It will be owner Role)
+            roles = await get_roles(keycloak_admin_token, 'owner')
             if not roles:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Dev role not found in realm"
+                    detail=f"Owner role not found in realm"
                 )
             role_id = roles.get('id')
             
-            await assign_realm_role_to_user(keycloak_admin_token, user_id, role_id, 'dev')
+            await assign_realm_role_to_user(keycloak_admin_token, user_id, role_id, 'owner')
         
         # Create or verify user mapping
         user_result = await create_user_mapper(
-            user_id=user_id,
+            user_keycloak_uid=user_id,
             email=name_id,
-            role_id=role_id,
-            group_id=group_id,
+            role_keycloak_uid=role_id,
+            group_keycloak_uid=group_id,
             group_name=group_name,
             session=session,
             first_name=first_name,
@@ -500,7 +550,7 @@ async def initiate_tokens(code: str, session_index: str):
         last_name = session_data["attributes"]["urn:oid:2.5.4.4"][0]    # surname
         admin_token = await get_cached_admin_token()
         # get the roles of the user from the middleware db
-        roles = await get_composite_roles(admin_token, 'dev')
+        roles = await get_composite_roles(admin_token, 'owner')
         print(f"******* Roles: {roles} *******")
         
         # Create tokens
@@ -533,9 +583,18 @@ async def initiate_tokens(code: str, session_index: str):
         print(f"******* Exception: {e} *******")
         raise HTTPException(status_code=500, detail=str(e))
     
-async def initiate_refresh_token(current_user: dict):
+async def initiate_refresh_token(request: Request, refresh_token_data: dict, session: AsyncSession):
     try:
-        session_index = current_user.get("session_index")
+        session_index = refresh_token_data.get("session_index")
+        refresh_token = refresh_token_data.get("token")
+        
+        # Check if refresh token is blacklisted
+        if await is_token_blacklisted(refresh_token, session):
+            raise HTTPException(
+                status_code=401,
+                detail="Refresh token has been invalidated"
+            )
+        
         # Get session data from Redis using session_index
         session_data_str = redis_client.get(f"saml_session:{session_index}")
         if not session_data_str:
@@ -547,34 +606,46 @@ async def initiate_refresh_token(current_user: dict):
                     "status": "error"
                 }
             )
-
-        session_data = json.loads(session_data_str)
         
-        print(f"******* Session Data in Refresh Token: {session_data} *******")
+        # Verify refresh token
+        payload = jwt.decode(
+            refresh_token,
+            Config.SECRET_KEY,
+            algorithms=["HS256"]
+        )
         
-        email = session_data.get("email")
-        roles = session_data.get("roles")
+        print(f"******* Payload: {payload} *******")
         
         # Generate new access token
-        new_access_token = create_token(email, session_index, "access")
+        new_access_token = create_token(payload.get("sub"), payload.get("session_index"), "access")
         # Generate new refresh token
-        new_refresh_token = create_token(email, session_index, "refresh")
+        new_refresh_token = create_token(payload.get("sub"), payload.get("session_index"), "refresh")
+        
+         # Blacklist the old refresh token
+        await add_to_blacklist(refresh_token, session)
                 
         return JSONResponse({
             "access_token": new_access_token,
             "refresh_token": new_refresh_token,
         })
         
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Refresh token has expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid refresh token"
+        )
     except Exception as e:
         print(f"Refresh token error: {str(e)}")
-        return JSONResponse(
+        raise HTTPException(
             status_code=500,
-            content={
-                "error": "server_error",
-                "error_description": str(e),
-                "status": "error"
-            }
+            detail="Internal server error"
         )
+
         
 async def me(current_user: dict):
     try:
@@ -601,14 +672,18 @@ async def me(current_user: dict):
             }
         )
         
-async def logout_user(request: Request, current_user: dict):
+async def logout_user(request: Request, refresh_token_data: dict, session: AsyncSession):
     try:
+        
+        print(f"******* Refresh Token: {refresh_token_data} *******")
         print(f"******* JUST LOGOUT CALLED *******")
-        print(f"******* Current User: {current_user} *******")
-        name_id = current_user.get("name_id")
-        session_index = current_user.get("session_index")
-        print(f"******* Name ID: {name_id} *******")
-        print(f"******* Session Index: {session_index} *******")
+        
+        
+        session_index = refresh_token_data.get("session_index")
+        name_id = refresh_token_data.get("sub")
+        refresh_token = refresh_token_data.get("token")
+        
+        await add_to_blacklist(refresh_token, session)
         
         if not name_id or not session_index:
             return JSONResponse(

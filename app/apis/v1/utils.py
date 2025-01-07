@@ -8,7 +8,7 @@ TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/open
 REDIRECT_URI = f"{Config.BASE_URL}/auth/callback"
 
 ADMIN_TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/master/protocol/openid-connect/token"
-DEV_ROLE_NAME = "dev"
+DEV_ROLE_NAME = "owner"
 
 async def get_keycloak_admin() -> str:
     """Get a new admin token from Keycloak"""

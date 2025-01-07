@@ -8,7 +8,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.db.session import get_session
 from app.core.config import Config
-from app.apis.v1.oidc_auth.crud import create_user_mapper
+from app.apis.v1.saml_auth.crud import create_user_mapper
 
 auth_router = APIRouter()
 
@@ -20,7 +20,7 @@ AUTH_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openi
 REDIRECT_URI = f"{Config.BASE_URL}/auth/callback"
 
 ADMIN_TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/master/protocol/openid-connect/token"
-DEV_ROLE_NAME = "dev"
+DEV_ROLE_NAME = "owner"
 
 
 

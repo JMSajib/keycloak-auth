@@ -1,4 +1,4 @@
-from app.apis.v1.oidc_auth.models import UserMapper
+from app.apis.v1.saml_auth.models import UserMapper
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
 
