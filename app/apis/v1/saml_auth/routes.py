@@ -4,7 +4,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.apis.v1.saml_auth.crud import (
     get_refresh_token,
-    get_current_user, 
+    token_required, 
     initiate_saml_login,
     assertion_consumer_service,
     initiate_tokens,
@@ -37,13 +37,13 @@ async def get_tokens(
     
 
 @auth_saml.get("/refresh")
-async def refresh_token(request: Request, refresh_token_data: dict = Depends(get_refresh_token), session: AsyncSession = Depends(get_session)):
-    return await initiate_refresh_token(request, refresh_token_data, session)
+async def refresh_token(refresh_token_data: dict = Depends(get_refresh_token), session: AsyncSession = Depends(get_session)):
+    return await initiate_refresh_token(refresh_token_data, session)
 
 
 @auth_saml.get("/me")
-async def get_user_info(current_user: dict = Depends(get_current_user)):
-    return await me(current_user)
+async def get_user_info(current_user: dict = Depends(token_required), session: AsyncSession = Depends(get_session)):
+    return await me(current_user, session)
     
 
 @auth_saml.get("/logout")

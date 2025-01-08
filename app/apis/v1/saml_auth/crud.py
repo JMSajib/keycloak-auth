@@ -102,19 +102,47 @@ def create_token(sub:str, session_index: str, token_type: str = "access"):
     payload = {
         "sub": sub,
         "session_index": session_index,
-        "exp": datetime.now(UTC) + timedelta(hours=1) if token_type == "access" else datetime.now(UTC) + timedelta(days=30)
+        "sso_user": True
+,       "exp": datetime.now(UTC) + timedelta(hours=1) if token_type == "access" else datetime.now(UTC) + timedelta(days=30)
     }
     return jwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
 async def get_refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = jwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
-    return {
-        "token": token,
-        "sub": payload.get("sub"),
-        "session_index": payload.get("session_index")
-    }
+    try:
+        token = credentials.credentials
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="No token found"
+            )
+        # Verify JWT token
+        payload = jwt.decode(
+            token,
+            Config.SECRET_KEY,
+            algorithms=["HS256"]
+        )
+        # Validate required claims
+        if not payload.get("sub"):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid token: missing subject claim"
+            )
+        return {
+            "token": token,
+            "sub": payload.get("sub"),
+            "session_index": payload.get("session_index")
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Refresh token has expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid refresh token"
+        )
 
 async def add_to_blacklist(token: str, session: AsyncSession) -> None:
     """Add a token to the blacklist"""
@@ -235,62 +263,30 @@ async def create_user_mapper(user_keycloak_uid, email, role_keycloak_uid, group_
 
 
     
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), session: AsyncSession = Depends(get_session)) -> dict:
+async def token_required(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
     Validate JWT token and return current user data from Redis session
     """
     try:
         token = credentials.credentials
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="No token found"
+            )
         # Verify JWT token
         payload = jwt.decode(
             token,
             Config.SECRET_KEY,
             algorithms=["HS256"]
         )
-        
-        email = payload.get("sub")
-        session_index = payload.get("session_index")
-
-        # First try Redis cache
-        session_data_str = redis_client.get(f"saml_session:{session_index}")
-        if session_data_str:
-            return json.loads(session_data_str)
-            
-        # If not in Redis, check database
-        statement = select(UserMapper).where(UserMapper.email == email)
-        result = await session.exec(statement)
-        user = result.first()
-        
-        if not user:
+        # Validate required claims
+        if not payload.get("sub"):
             raise HTTPException(
                 status_code=401,
-                detail="User not found"
+                detail="Invalid token: missing subject claim"
             )
-
-        # Get user roles
-        admin_token = await get_cached_admin_token()
-        roles = await get_composite_roles(admin_token, 'owner')
-        print(f"********** ME {roles} *********")
-
-        # Create new session data
-        session_data = {
-            "name_id": email,
-            "email": email,
-            "firstName": user.first_name,
-            "lastName": user.last_name,
-            "roles": roles,
-            "session_index": session_index
-        }
-
-        # Store back in Redis for future requests
-        redis_client.setex(
-            f"saml_session:{session_index}",
-            60 * 60 * 24 * 30,  # 30 days
-            json.dumps(session_data)
-        )
-
-        return session_data
-        
+        return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=401,
@@ -443,11 +439,6 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
         name_id = auth.get_nameid()
         session_index = auth.get_session_index()
         
-                
-        print(f"Attributes: {attributes}")
-        print(f"Name ID: {name_id}")
-        print(f"Session Index: {session_index}")
-        
         user_id = attributes['user_id'][0]
         
         # or session_data["attributes"]["urn:oid:1.2.840.113549.1.9.1"][0]
@@ -458,9 +449,9 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
             # Get project and role details from invitation token
             # project_details = await validate_invitation_token(invitation_token)
             # if invitation_token is not valid, raise an error and redirect to the frontend
-            role_id = "c378f016-62d1-42a9-8eaf-c53750f29ef8"
-            group_id = "c378f016-62d1-42a9-8eaf-c53750f29ef7"
-            group_name = "project-2"
+            role_id = "c378f016-62d1-42a9-8eaf-c53750f29ef9"
+            group_id = "ca45e5cb-92c3-4537-850b-a586e7f0e816"
+            group_name = "jahidul.momin.sajib-group"
         else:
             # First time user setup with owner role
             keycloak_admin_token = await get_cached_admin_token()
@@ -492,11 +483,9 @@ async def assertion_consumer_service(request: Request, session: AsyncSession = D
             last_name=last_name,
             invitation_token=invitation_token
         )
-        
-        print(f"******* User Result: {user_result} *******")
 
         # Generate temporary code
-        temp_code = secrets.token_urlsafe(32)
+        temp_code = secrets.token_urlsafe(64)
         
         # Store SAML session data
         session_data = {
@@ -545,34 +534,11 @@ async def initiate_tokens(code: str, session_index: str):
         redis_client.delete(f"saml_code:{code}")
         
         # Extract user information
-        email = session_data["name_id"]  # or session_data["attributes"]["urn:oid:1.2.840.113549.1.9.1"][0]
-        first_name = session_data["attributes"]["urn:oid:2.5.4.42"][0]  # givenName
-        last_name = session_data["attributes"]["urn:oid:2.5.4.4"][0]    # surname
-        admin_token = await get_cached_admin_token()
-        # get the roles of the user from the middleware db
-        roles = await get_composite_roles(admin_token, 'owner')
-        print(f"******* Roles: {roles} *******")
+        email = session_data["name_id"]
         
         # Create tokens
         access_token = create_token(email, session_index, "access")
         refresh_token = create_token(email, session_index, "refresh")
-        
-        # Create session data
-        session_data = {
-            "name_id": email,
-            "email": email,
-            "firstName": first_name,
-            "lastName": last_name,
-            "roles": roles,
-            "session_index": session_index
-        }
-        
-        # Store session in Redis
-        redis_client.setex(
-            f"saml_session:{session_index}",
-            60 * 60 * 24 * 30,  # 30 days
-            json.dumps(session_data)
-        )
         
         return JSONResponse({
             "access_token": access_token,
@@ -583,10 +549,17 @@ async def initiate_tokens(code: str, session_index: str):
         print(f"******* Exception: {e} *******")
         raise HTTPException(status_code=500, detail=str(e))
     
-async def initiate_refresh_token(request: Request, refresh_token_data: dict, session: AsyncSession):
+async def initiate_refresh_token(refresh_token_data: dict, session: AsyncSession):
     try:
         session_index = refresh_token_data.get("session_index")
         refresh_token = refresh_token_data.get("token")
+        email = refresh_token_data.get("sub")
+        
+        user_statement = select(UserMapper).where(UserMapper.email == email)
+        result = await session.exec(user_statement)
+        user = result.first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
         
         # Check if refresh token is blacklisted
         if await is_token_blacklisted(refresh_token, session):
@@ -595,50 +568,18 @@ async def initiate_refresh_token(request: Request, refresh_token_data: dict, ses
                 detail="Refresh token has been invalidated"
             )
         
-        # Get session data from Redis using session_index
-        session_data_str = redis_client.get(f"saml_session:{session_index}")
-        if not session_data_str:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_session",
-                    "error_description": "Session not found",
-                    "status": "error"
-                }
-            )
-        
-        # Verify refresh token
-        payload = jwt.decode(
-            refresh_token,
-            Config.SECRET_KEY,
-            algorithms=["HS256"]
-        )
-        
-        print(f"******* Payload: {payload} *******")
-        
         # Generate new access token
-        new_access_token = create_token(payload.get("sub"), payload.get("session_index"), "access")
+        new_access_token = create_token(email, session_index, "access")
         # Generate new refresh token
-        new_refresh_token = create_token(payload.get("sub"), payload.get("session_index"), "refresh")
+        new_refresh_token = create_token(email, session_index, "refresh")
         
-         # Blacklist the old refresh token
+        # Blacklist the old refresh token
         await add_to_blacklist(refresh_token, session)
                 
         return JSONResponse({
             "access_token": new_access_token,
             "refresh_token": new_refresh_token,
         })
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token has expired"
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid refresh token"
-        )
     except Exception as e:
         print(f"Refresh token error: {str(e)}")
         raise HTTPException(
@@ -647,20 +588,107 @@ async def initiate_refresh_token(request: Request, refresh_token_data: dict, ses
         )
 
         
-async def me(current_user: dict):
+async def me(current_user: dict, session: AsyncSession):
     try:
+        email = current_user.get("sub")
+        session_index = current_user.get("session_index")
+        
+        user_statement = select(UserMapper).where(UserMapper.email == email)
+        result = await session.exec(user_statement)
+        user = result.first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        session_data_str = redis_client.get(f"saml_session_for_user:{session_index}")
+        if session_data_str:
+            print(f"******* Session Data: {json.loads(session_data_str)} *******")
+            print(f"Return from Redis Cache")
+            return JSONResponse({
+                "status": "success",
+                "data": json.loads(session_data_str)
+            })
+        
+        user_project_statement = select(
+            UserMapper.id,
+            UserMapper.email,
+            UserMapper.first_name,
+            UserMapper.last_name,
+            Role.id.label('role_id'),
+            Role.role_keycloak_uid.label('role_uid'),
+            Role.role_name,
+            Project.id.label('project_id'),
+            Project.project_keycloak_uid.label('project_uid'),
+            Project.project_name
+        ).join(
+            UserRoleProject, UserMapper.id == UserRoleProject.user_id
+        ).join(
+            Role, UserRoleProject.role_id == Role.id
+        ).join(
+            Project, UserRoleProject.project_id == Project.id
+        ).where(
+            UserMapper.email == email
+        )
+        
+        result = await session.exec(user_project_statement)
+        user_projects = result.all()
+        
+        if not user_projects:
+            raise HTTPException(status_code=404, detail="User projects not found")
+        
+        # Get Keycloak admin token
+        admin_token = await get_cached_admin_token()
+        
+        
+        projects_info = []
+        for row in user_projects:
+            # Try to get cached permissions for this role
+            cached_permissions = redis_client.get(f"role_permissions:{row.role_name}")
+            
+            if cached_permissions:
+                print(f"Cache hit: Using cached permissions for role {row.role_name}")
+                role_permissions = json.loads(cached_permissions)
+            else:
+                print(f"Cache miss: Fetching permissions for role {row.role_name}")
+                # Get permissions from Keycloak
+                role_permissions = await get_composite_roles(admin_token, row.role_name)
+                # Cache the permissions for this role (1 hour expiry)
+                redis_client.set(
+                    f"role_permissions:{row.role_name}",
+                    json.dumps(role_permissions)
+                )
+
+            projects_info.append({
+                "project_id": row.project_id,
+                "project_uid": str(row.project_uid),
+                "project_name": row.project_name,
+                "role_id": row.role_id,
+                "role_uid": str(row.role_uid),
+                "role_name": row.role_name,
+                "permissions": role_permissions
+            })
+
+        # Create new session data
+        session_data = {
+            "user_id": user.id,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "name_id": user.email,
+            "email": user.email,
+            "projects": projects_info
+        }
+
+        # Store back in Redis for future requests
+        redis_client.setex(
+            f"saml_session_for_user:{session_index}",
+            60 * 60 * 24 * 30,  # 30 days
+            json.dumps(session_data)
+        )
+
+        print(f"******* Session Data From DB: {session_data} *******")  
         return JSONResponse({
             "status": "success",
-            "user": {
-                "id": current_user.get("email"),
-                "email": current_user.get("email"),
-                "firstName": current_user.get("firstName"),
-                "lastName": current_user.get("lastName"),
-                "roles": current_user.get("roles"),
-                "sessionIndex": current_user.get("session_index"),
-            }
+            "data": session_data
         })
-        
     except Exception as e:
         print(f"******* Exception IN GET USER INFO API: {e} *******")
         return JSONResponse(
@@ -674,26 +702,18 @@ async def me(current_user: dict):
         
 async def logout_user(request: Request, refresh_token_data: dict, session: AsyncSession):
     try:
-        
-        print(f"******* Refresh Token: {refresh_token_data} *******")
         print(f"******* JUST LOGOUT CALLED *******")
-        
-        
         session_index = refresh_token_data.get("session_index")
-        name_id = refresh_token_data.get("sub")
+        email = refresh_token_data.get("sub")
         refresh_token = refresh_token_data.get("token")
         
-        await add_to_blacklist(refresh_token, session)
+        user_statement = select(UserMapper).where(UserMapper.email == email)
+        result = await session.exec(user_statement)
+        user = result.first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
         
-        if not name_id or not session_index:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "invalid_session_index",
-                    "error_description": "Invalid Session Index",
-                    "status": "error"
-                }
-            )
+        await add_to_blacklist(refresh_token, session)
 
         req = {
             'https': 'on' if request.url.scheme == 'https' else 'off',
@@ -708,7 +728,7 @@ async def logout_user(request: Request, refresh_token_data: dict, session: Async
         auth = init_saml_auth(req)
 
         slo_url = auth.logout(
-            name_id=name_id,
+            name_id=email,
             session_index=session_index,
             return_to=FRONTEND_BASE_URL
         )
