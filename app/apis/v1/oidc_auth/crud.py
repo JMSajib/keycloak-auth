@@ -1,18 +1,47 @@
+
 from datetime import datetime, timedelta, UTC
-import jwt
-from app.core.config import Config
-from app.apis.v1.saml_auth.models import UserMapper
-from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel import select
+import random, uuid, json, secrets, jwt
+import requests
+from urllib.parse import quote
+
+from fastapi import status
+from fastapi.responses import JSONResponse
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPAuthorizationCredentials
+
+from app.core.config import Config
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel import select
+
 from app.core.security import security
 from app.core.redis_client import redis_client
-from fastapi.responses import JSONResponse
-import json
 
-from app.apis.v1.saml_auth.models import Role, Project, UserRoleProject
-from app.apis.v1.utils import get_cached_admin_token, get_composite_roles
+from app.apis.v1.saml_auth.models import (
+    Role, 
+    Project, 
+    UserRoleProject, 
+    BlackListedToken, 
+    UserMapper
+)
+
+from app.apis.v1.utils import (
+    get_groups_or_create_groups, 
+    get_roles, 
+    assign_realm_role_to_user,
+    get_cached_admin_token,
+    add_user_to_group,
+    get_user_info,
+    get_composite_roles
+)
+
+
+from app.apis.v1.oidc_auth.schemas import TokenRequest
+
+
+TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/token"
+AUTH_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/auth"
+REDIRECT_URI = f"{Config.FRONTEND_BASE_URL}/auth/callback"
+
 
 def create_token(sub:str, token_type: str = "access"):
     payload = {
@@ -23,35 +52,98 @@ def create_token(sub:str, token_type: str = "access"):
     return jwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
-async def create_user_mapper(user_id, email, dev_role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None,):
-    """Create a new user mapping"""
+async def create_user_mapper(user_keycloak_uid, email, role_keycloak_uid, group_keycloak_uid, group_name, session: AsyncSession, first_name:str=None, last_name:str=None, invitation_token:str=None):
+    """Handle user mapping for both new and invited users"""
     try:
-        statement = select(UserMapper).where(
-            UserMapper.user_uid == user_id,
-            UserMapper.group_id == group_id
-        )
-        result = await session.exec(statement)
-        existing_user = result.first()
+        # Convert strings to UUID
+        user_uid = uuid.UUID(user_keycloak_uid)
+        project_uid = uuid.UUID(group_keycloak_uid)
+        role_uid = uuid.UUID(role_keycloak_uid)
         
-        if existing_user:
-            print(f"User already exists in project {group_name} with role {existing_user.role_id}")
-            raise Exception(f"User already exists in project {group_name} with role {existing_user.role_id}")
-        user_mapper = UserMapper(
-            user_uid=user_id,
-            role_id=dev_role_id,
-            group_id=group_id,
-            project_name=group_name,
-            username=email,
-            email=email,
-            first_name=first_name,
-            last_name=last_name
+        # 1. Get or create user
+        user_stmt = select(UserMapper).where(UserMapper.user_keycloak_uid == user_uid)
+        result = await session.exec(user_stmt)
+        user = result.first()
+        
+        if not user:
+            user = UserMapper(
+                user_core_id=random.randint(1, 1000000),
+                user_keycloak_uid=user_uid,
+                username=email,
+                email=email,
+                first_name=first_name,
+                last_name=last_name
+            )
+            session.add(user)
+            await session.flush()  # Just flush to get the ID
+            
+        # 2. Get or create project
+        project_stmt = select(Project).where(Project.project_keycloak_uid == project_uid)
+        result = await session.exec(project_stmt)
+        project = result.first()
+        
+        if not project:
+            project = Project(
+                project_keycloak_uid=project_uid,
+                project_name=group_name
+            )
+            session.add(project)
+            await session.flush()  # Just flush to get the ID
+            
+        # 3. Get role
+        role_stmt = select(Role).where(Role.role_keycloak_uid == role_uid)
+        result = await session.exec(role_stmt)
+        role = result.first()
+        
+        if not role:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Role with keycloak_uid {role_keycloak_uid} not found"
+            )
+            
+        # 4. Check if user-role-project mapping exists
+        mapping_stmt = select(UserRoleProject).where(
+            UserRoleProject.user_id == user.id,
+            UserRoleProject.project_id == project.id
         )
-        session.add(user_mapper)
+        result = await session.exec(mapping_stmt)
+        existing_mapping = result.first()
+        
+        if existing_mapping:
+            # User already has a role in this project
+            return {
+                "status": "exists",
+                "message": f"User already has role {existing_mapping.role_id} in project {project.project_name}"
+            }
+        
+        # 5. Create new user-role-project mapping
+        new_mapping = UserRoleProject(
+            user_id=user.id,
+            role_id=role.id,
+            project_id=project.id
+        )
+        session.add(new_mapping)
+        
+        # Only commit once at the end
         await session.commit()
-        return user_mapper
+        
+        return {
+            "status": "success",
+            "message": "User role mapping created successfully",
+            "data": {
+                "user_id": user.id,
+                "project_id": project.id,
+                "role_id": role.id
+            }
+        }
+            
     except Exception as e:
-        session.rollback()
-        raise Exception(f"Failed to create user: {str(e)}")
+        await session.rollback()
+        print(f"Error in create_user_mapper: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process user: {str(e)}"
+        )
     
 async def token_required(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """
@@ -95,6 +187,172 @@ async def token_required(credentials: HTTPAuthorizationCredentials = Depends(sec
         )
         
         
+async def get_refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="No token found"
+            )
+        # Verify JWT token
+        payload = jwt.decode(
+            token,
+            Config.SECRET_KEY,
+            algorithms=["HS256"]
+        )
+        # Validate required claims
+        if not payload.get("sub"):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid token: missing subject claim"
+            )
+        return {
+            "token": token,
+            "sub": payload.get("sub"),
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Refresh token has expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid refresh token"
+        )
+        
+async def login_request(provider: str, invitation_token: str = None):
+    """
+    Handle social login initialization for different providers
+    """
+    if provider not in ["google", "oidc"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported provider"
+        )
+    state = secrets.token_urlsafe(64)
+    if invitation_token:
+        print(f"******* Invitation Token: {invitation_token} *******")
+        # Store state in Redis
+        redis_client.setex(
+            f"invitation_code:{state}",
+            300,  # 5 minutes
+            invitation_token
+        )
+    # Construct authorization URL for the social provider
+    auth_params = {
+        "client_id": Config.KEYCLOAK_CLIENT_ID,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "redirect_uri": REDIRECT_URI,
+        "kc_idp_hint": provider,
+        "state": state
+    }
+    
+    auth_url = f"{AUTH_URL}?{'&'.join(f'{k}={quote(v)}' for k, v in auth_params.items())}"
+    return {"auth_url": auth_url}
+
+
+        
+async def callback_function(request: TokenRequest, session: AsyncSession):
+    print(f"************** CALLBACK CALLED ***************")
+    print(f"request: {request}")
+    print(f"code: {request.code}, session_state: {request.session_state}")
+    if not request.code or not request.session_state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authorization code and session state are required"
+        )
+    if request.state:
+        invitation_token = redis_client.get(f"invitation_code:{request.state}")
+        print(f"******* Invitation Token: {invitation_token} *******")
+        redis_client.delete(f"invitation_code:{request.state}")
+    
+    code = request.code
+    session_state = request.session_state
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": Config.KEYCLOAK_CLIENT_ID,
+        "client_secret": Config.KEYCLOAK_CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "session_state": session_state
+    }
+    
+    try:
+        token_response = requests.post(TOKEN_URL, data=token_data)
+        if token_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token exchange failed"
+            )
+
+        tokens = token_response.json()
+        user_info = get_user_info(tokens["access_token"])
+        email = user_info.get('email')
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email not provided by authentication provider"
+            )
+        
+        # if invitation_token:
+        #     pass
+        # else:
+        #     pass
+        
+        # Initialize Keycloak admin
+        keycloak_admin_token = await get_cached_admin_token()
+
+        group_name = f"{email.split('@')[0]}-project"  # Use part before @ as group name
+        group_id = await get_groups_or_create_groups(keycloak_admin_token, group_name)
+        
+        # Add user to group
+        await add_user_to_group(keycloak_admin_token, user_info['sub'], group_id)
+        
+        # Get owner role
+        roles = await get_roles(keycloak_admin_token, 'owner')
+        if not roles:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"'{'owner'}' role not found in realm"
+            )
+        role_id = roles.get('id')
+        await assign_realm_role_to_user(keycloak_admin_token, user_info['sub'], role_id, 'owner')
+        # create user mapper
+        # user_id, email, dev_role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None,
+        await create_user_mapper(user_info['sub'], email, role_id, group_id, group_name, session, user_info.get('first_name'), user_info.get('last_name'))
+        
+        # Create tokens
+        access_token = create_token(email, "access")
+        refresh_token = create_token(email, "refresh")
+        
+        token_data = {
+            "access_token": tokens.get("access_token"),
+            "refresh_token": tokens.get("refresh_token")
+        }
+        redis_client.set(
+            f"keycloak_tokens:{email}",
+            json.dumps(token_data)
+        )
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token
+        }
+
+    except HTTPException as he:
+        print(f"HTTPException Onboarding: {he}")
+        raise he
+    except Exception as e:
+        print(f"Exception During Authentication: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during authentication"
+        )
+        
+        
 async def me(current_user: dict, session: AsyncSession):
     try:
         email = current_user.get("sub")
@@ -107,8 +365,6 @@ async def me(current_user: dict, session: AsyncSession):
         
         session_data_str = redis_client.get(f"oidc_for_user:{email}")
         if session_data_str:
-            print(f"******* Session Data: {json.loads(session_data_str)} *******")
-            print(f"Return from Redis Cache")
             return JSONResponse({
                 "status": "success",
                 "data": json.loads(session_data_str)
@@ -204,4 +460,117 @@ async def me(current_user: dict, session: AsyncSession):
                 "error_description": str(e),
                 "status": "error"
             }
+        )
+
+
+async def add_to_blacklist(token: str, session: AsyncSession) -> None:
+    """Add a token to the blacklist"""
+    try:
+        blacklisted_token = BlackListedToken(token=token)
+        session.add(blacklisted_token)
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        print(f"Error blacklisting token: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to blacklist token: {e}"
+        )
+
+
+async def is_token_blacklisted(token: str, session: AsyncSession) -> bool:
+    """Check if a token is blacklisted"""
+    try:
+        statement = select(BlackListedToken).where(BlackListedToken.token == token)
+        result = await session.exec(statement)
+        return bool(result.first())
+    except Exception as e:
+        print(f"Error checking blacklist: {e}")
+        return False        
+
+
+async def logout_user(current_user: dict, session: AsyncSession):
+    try:
+        email = current_user.get("sub")
+        token_data = redis_client.get(f"keycloak_tokens:{email}")
+        refresh_token = None
+        access_token = None
+        if token_data:
+            token_data = json.loads(token_data)
+            refresh_token = token_data.get("refresh_token")
+            access_token = token_data.get("access_token")
+        else:
+            pass
+        
+        # Construct logout URL with all necessary parameters
+        logout_params = {
+            'client_id': Config.KEYCLOAK_CLIENT_ID,
+            'client_secret': Config.KEYCLOAK_CLIENT_SECRET,
+            'refresh_token': refresh_token  # Using access token here
+        }
+        
+        # End Keycloak session using the logout endpoint
+        response = requests.post(
+            f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/logout",
+            data=logout_params
+        )
+        
+        if response.status_code not in [200, 204]:
+            print(f"Keycloak logout failed with status {response.status_code}: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to logout from authentication server"
+            )
+        redis_client.delete(f"keycloak_tokens:{email}")
+        redis_client.delete(f"oidc_for_user:{email}")
+
+        return {
+            "message": "Logged out successfully",
+            "status": "success"
+        }
+
+    except Exception as e:
+        print(f"Error during logout process: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error during logout: {str(e)}"
+        )
+
+        
+async def initiate_refresh_token(refresh_token_data: dict, session: AsyncSession):
+    try:
+        refresh_token = refresh_token_data.get("token")
+        email = refresh_token_data.get("sub")
+        
+        user_statement = select(UserMapper).where(UserMapper.email == email)
+        result = await session.exec(user_statement)
+        user = result.first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Check if refresh token is blacklisted
+        if await is_token_blacklisted(refresh_token, session):
+            return JSONResponse({
+                "status": "error",
+                "error": "invalid_token",
+                "error_description": "Refresh token has been invalidated"
+            }, status_code=401)
+        
+        # Generate new access token
+        new_access_token = create_token(email, "access")
+        # Generate new refresh token
+        new_refresh_token = create_token(email, "refresh")
+        
+        # Blacklist the old refresh token
+        await add_to_blacklist(refresh_token, session)
+                
+        return JSONResponse({
+            "access_token": new_access_token,
+            "refresh_token": new_refresh_token,
+        })
+    except Exception as e:
+        print(f"Refresh token error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error"
         )

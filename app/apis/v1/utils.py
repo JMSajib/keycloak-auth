@@ -110,8 +110,6 @@ async def get_groups_or_create_groups(access_token: str, group_name: str):
         )
         
 async def add_user_to_group(access_token: str, user_id: str, group_id: str):
-    print(f"******* User ID: {user_id} *******")
-    print(f"******* Group ID: {group_id} *******")
     """Helper function to add user to group if not already a member"""
     headers = {"Authorization": f"Bearer {access_token}"}
     
@@ -120,8 +118,6 @@ async def add_user_to_group(access_token: str, user_id: str, group_id: str):
     response = requests.get(user_groups_url, headers=headers)
     response.raise_for_status()
     current_groups = response.json()
-    
-    print(f"Current groups: {current_groups}")
     
     # Check if user is already in the group
     if any(group['id'] == group_id for group in current_groups):
@@ -158,3 +154,23 @@ async def get_composite_roles(access_token, role_name):
     
     role_names = [role['name'] for role in roles]
     return role_names
+
+
+def get_user_info(access_token: str) -> dict:
+    """
+    Get user info from Keycloak using access token specifically for logout
+    """
+    try:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        userinfo_url = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/userinfo"
+        
+        response = requests.get(userinfo_url, headers=headers)
+        response.raise_for_status()  # This will raise an exception for 401 and other error status codes
+        
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error getting user info: {e.response.status_code} - {e.response.text}")
+        return None
+    except Exception as e:
+        print(f"Error getting user info: {e}")
+        return None

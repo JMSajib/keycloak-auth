@@ -8,3 +8,4 @@ class TokenResponse(BaseModel):
 class TokenRequest(BaseModel):
     code: str
     session_state: str
+    state: str = None
