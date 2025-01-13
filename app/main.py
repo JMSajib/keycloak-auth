@@ -38,7 +38,7 @@ def create_app() -> FastAPI:
 
 def register_routers(app: FastAPI) -> None:
     """Register all routers for the application."""
-    app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix="/api/v1/auth/oidc")
     app.include_router(auth_saml, prefix="/api/v1/auth/saml")
 
 # Create the application instance

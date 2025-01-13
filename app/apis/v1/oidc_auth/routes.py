@@ -8,20 +8,26 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.db.session import get_session
 from app.core.config import Config
-from app.apis.v1.saml_auth.crud import create_user_mapper
+from app.apis.v1.oidc_auth.crud import create_user_mapper, create_token, token_required, me
 
-auth_router = APIRouter()
+from app.apis.v1.oidc_auth.schemas import TokenRequest, TokenResponse
+from app.core.redis_client import redis_client
+
+from app.apis.v1.utils import get_cached_admin_token
+import json
+auth_router = APIRouter(
+    tags=["oidc-auth"]
+)
 
 security = HTTPBearer()
 
 # Keycloak endpoints
 TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/token"
 AUTH_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/auth"
-REDIRECT_URI = f"{Config.BASE_URL}/auth/callback"
+REDIRECT_URI = f"{Config.FRONTEND_BASE_URL}/auth/callback"
 
 ADMIN_TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/master/protocol/openid-connect/token"
 DEV_ROLE_NAME = "owner"
-
 
 
 class LoginRequest(BaseModel):
@@ -137,61 +143,13 @@ async def get_composite_roles(access_token, role_name):
     role_names = [role['name'] for role in roles]
     return role_names
 
-@auth_router.post("/login")
-async def login(request: LoginRequest):
-    """
-    Unified login endpoint that handles both credentials and social login
-    """
-    try:
-        if request.login_type == "credentials":
-            if not request.username or not request.password:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Username and password are required for credentials login"
-                )
-            
-            # Handle direct login through Keycloak
-            token_data = {
-                "grant_type": "password",
-                "client_id": Config.KEYCLOAK_CLIENT_ID,
-                "client_secret": Config.KEYCLOAK_CLIENT_SECRET,
-                "username": request.username,
-                "password": request.password
-            }
-            
-            return await exchange_token(token_data)
-            
-        elif request.login_type in ["google", "facebook", "github"]:
-            # Return authorization URL for social login
-            auth_params = {
-                "client_id": Config.KEYCLOAK_CLIENT_ID,
-                "response_type": "code",
-                "scope": "openid email profile",
-                "redirect_uri": REDIRECT_URI,
-                "kc_idp_hint": request.login_type
-            }
-            
-            auth_url = f"{AUTH_URL}?{'&'.join(f'{k}={quote(v)}' for k, v in auth_params.items())}"
-            return {"auth_url": auth_url}
-            
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid login type"
-            )
-            
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
 
-@auth_router.post("/social-login/{provider}")
+@auth_router.get("/social-login/{provider}")
 async def social_login(provider: str):
     """
     Handle social login initialization for different providers
     """
-    if provider not in ["google", "facebook", "github"]:
+    if provider not in ["google", "oidc"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unsupported provider"
@@ -209,16 +167,21 @@ async def social_login(provider: str):
     auth_url = f"{AUTH_URL}?{'&'.join(f'{k}={quote(v)}' for k, v in auth_params.items())}"
     return {"auth_url": auth_url}
 
-@auth_router.get("/callback")
-async def social_callback(code: str, session_state: str, session: AsyncSession = Depends(get_session)):
+@auth_router.post("/token", response_model=TokenResponse)
+async def social_callback(request: TokenRequest, session: AsyncSession = Depends(get_session)):
+    print(f"************** CALLBACK CALLED ***************")
+    print(f"code: {request.code}, session_state: {request.session_state}")
     """
     Handle callback from social login providers
     """
-    if not code or not session_state:
+    if not request.code or not request.session_state:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Authorization code and session state is required"
+            detail="Authorization code and session state are required"
         )
+    
+    code = request.code
+    session_state = request.session_state
 
     token_data = {
         "grant_type": "authorization_code",
@@ -238,13 +201,12 @@ async def social_callback(code: str, session_state: str, session: AsyncSession =
             )
 
         tokens = token_response.json()
+        print(f"************** TOKENS ***************")
+        print(f"tokens: {tokens}")
         user_info = get_user_info(tokens["access_token"])
         
-        
-        # Initialize Keycloak admin
-        keycloak_admin_token = await get_keycloak_admin()
-        
-        # Get or create group based on email
+        # print(f"************** USER INFO ***************")
+        # print(f"user_info: {user_info}")
         email = user_info.get('email')
         if not email:
             raise HTTPException(
@@ -252,13 +214,21 @@ async def social_callback(code: str, session_state: str, session: AsyncSession =
                 detail="Email not provided by authentication provider"
             )
         
-        group_name = f"{email.split('@')[0]}-group"  # Use part before @ as group name
+        # if invitation_token:
+        #     pass
+        # else:
+        #     pass
+        
+        # Initialize Keycloak admin
+        keycloak_admin_token = await get_cached_admin_token()
+
+        group_name = f"{email.split('@')[0]}-project"  # Use part before @ as group name
         group_id = await get_groups_or_create_groups(keycloak_admin_token, group_name)
         
         # Add user to group
         await add_user_to_group(keycloak_admin_token, user_info['sub'], group_id)
         
-        # # Get dev role
+        # Get owner role
         roles = await get_roles(keycloak_admin_token, DEV_ROLE_NAME)
         if not roles:
             raise HTTPException(
@@ -268,14 +238,23 @@ async def social_callback(code: str, session_state: str, session: AsyncSession =
         role_id = roles.get('id')
         await assign_realm_role_to_user(keycloak_admin_token, user_info['sub'], role_id, DEV_ROLE_NAME)
         # create user mapper
-        await create_user_mapper(user_info, role_id, group_id, group_name, session)
+        # await create_user_mapper(user_info, role_id, group_id, group_name, session)
+        
+        # Create tokens
+        access_token = create_token(email, "access")
+        refresh_token = create_token(email, "refresh")
+        
+        token_data = {
+            "access_token": tokens.get("access_token"),
+            "refresh_token": tokens.get("refresh_token")
+        }
+        redis_client.set(
+            f"keycloak_tokens:{email}",
+            json.dumps(token_data)
+        )
         return {
-            "access_token": tokens["access_token"],
-            "refresh_token": tokens["refresh_token"],
-            "expires_in": tokens["expires_in"],
-            "token_type": tokens["token_type"],
-            "user": user_info,
-            "permissions": await get_composite_roles(keycloak_admin_token, DEV_ROLE_NAME)
+            "access_token": access_token,
+            "refresh_token": refresh_token
         }
 
     except HTTPException as he:
@@ -288,19 +267,24 @@ async def social_callback(code: str, session_state: str, session: AsyncSession =
             detail="Internal server error during authentication"
         )
 
-@auth_router.post("/refresh")
-async def refresh_token(refresh_token: str):
-    """
-    Refresh access token using refresh token
-    """
-    token_data = {
-        "grant_type": "refresh_token",
-        "client_id": Config.KEYCLOAK_CLIENT_ID,
-        "client_secret": Config.KEYCLOAK_CLIENT_SECRET,
-        "refresh_token": refresh_token
-    }
+# @auth_router.post("/refresh")
+# async def refresh_token(refresh_token: str):
+#     """
+#     Refresh access token using refresh token
+#     """
+#     token_data = {
+#         "grant_type": "refresh_token",
+#         "client_id": Config.KEYCLOAK_CLIENT_ID,
+#         "client_secret": Config.KEYCLOAK_CLIENT_SECRET,
+#         "refresh_token": refresh_token
+#     }
     
-    return await exchange_token(token_data)
+#     return await exchange_token(token_data)
+
+
+@auth_router.get("/me")
+async def get_user_info(current_user: dict = Depends(token_required), session: AsyncSession = Depends(get_session)):
+    return await me(current_user, session)
 
 async def exchange_token(token_data: dict):
     """
@@ -350,47 +334,47 @@ def get_user_info(access_token: str) -> dict:
 
 
 @auth_router.get('/logout')  # Changed to POST to match frontend expectations
-async def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def logout(current_user: dict = Depends(token_required), session: AsyncSession = Depends(get_session)):
     """
-    Logout endpoint that matches the Flask implementation
+    Logout endpoint that completely clears user session from Keycloak
     Requires Bearer token in Authorization header
     """
     try:
-        refresh_token = credentials.credentials
+        email = current_user.get("sub")
+        token_data = redis_client.get(f"keycloak_tokens:{email}")
+        refresh_token = None
+        access_token = None
+        if token_data:
+            token_data = json.loads(token_data)
+            refresh_token = token_data.get("refresh_token")
+            access_token = token_data.get("access_token")
+        else:
+            pass
         
-        # 1. Revoke the access token
-        try:
-            response = requests.post(
-                f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/revoke",
-                data={
-                    'client_id': Config.KEYCLOAK_CLIENT_ID,
-                    'client_secret': Config.KEYCLOAK_CLIENT_SECRET,
-                    'token': refresh_token,
-                    'token_type_hint': 'refresh_token'
-                }
+        # Construct logout URL with all necessary parameters
+        logout_params = {
+            'client_id': Config.KEYCLOAK_CLIENT_ID,
+            'client_secret': Config.KEYCLOAK_CLIENT_SECRET,
+            'refresh_token': refresh_token  # Using access token here
+        }
+        
+        # End Keycloak session using the logout endpoint
+        response = requests.post(
+            f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/logout",
+            data=logout_params
+        )
+        
+        if response.status_code not in [200, 204]:
+            print(f"Keycloak logout failed with status {response.status_code}: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to logout from authentication server"
             )
-            response.raise_for_status()
-        except Exception as e:
-            print(f"Error revoking access token: {e}")
-
-        # 2. End Keycloak session
-        try:
-            response = requests.post(
-                f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/logout",
-                headers={'Authorization': f'Bearer {refresh_token}'},
-                data={
-                    'client_id': Config.KEYCLOAK_CLIENT_ID,
-                    'client_secret': Config.KEYCLOAK_CLIENT_SECRET,
-                    'token': refresh_token
-                }
-            )
-            response.raise_for_status()
-        except Exception as e:
-            print(f"Error ending Keycloak session: {e}")
-
+        redis_client.delete(f"keycloak_tokens:{email}")
 
         return {
-            "message": "Logged out successfully"
+            "message": "Logged out successfully",
+            "status": "success"
         }
 
     except Exception as e:

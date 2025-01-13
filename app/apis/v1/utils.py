@@ -2,6 +2,11 @@ import requests
 from fastapi import HTTPException, status
 from app.core.config import Config
 from httpx import AsyncClient
+from datetime import datetime, timedelta, UTC
+import json
+from typing import Optional
+
+from app.core.redis_client import redis_client
 
 
 TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/token"
@@ -38,6 +43,42 @@ async def get_keycloak_admin() -> str:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+        
+        
+async def get_cached_admin_token() -> Optional[str]:
+    """Get admin token from cache or fetch new one if expired"""
+    try:
+        # Try to get cached token and its expiration
+        cached_data = redis_client.get("keycloak_admin_token")
+        
+        if cached_data:
+            cached_data = json.loads(cached_data)
+            expiration = datetime.fromisoformat(cached_data['expiration'])
+            
+            # If token is still valid (with 30s buffer), return it
+            if datetime.now(UTC) < (expiration - timedelta(seconds=30)):
+                return cached_data['token']
+        
+        # If no valid cached token, get new one
+        admin_token = await get_keycloak_admin()
+        
+        # Cache the new token with expiration (typical Keycloak token expires in 60s)
+        token_data = {
+            'token': admin_token,
+            'expiration': (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+        }
+        redis_client.setex(
+            "keycloak_admin_token",
+            55,  # Store for 55 seconds (slightly less than actual expiration)
+            json.dumps(token_data)
+        )
+        
+        return admin_token
+        
+    except Exception as e:
+        print(f"Error getting cached admin token: {e}")
+        # Fallback to direct token fetch if caching fails
+        return await get_keycloak_admin()
         
         
 async def get_groups_or_create_groups(access_token: str, group_name: str):

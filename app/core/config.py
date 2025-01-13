@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     JWT_ALGORITHM: str
     
-    KEYCLOAK_URL: str = "http://127.0.0.1:8080"
+    KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = 'sso-realm'
     KEYCLOAK_CLIENT_ID: str = 'sso-client'
     KEYCLOAK_CLIENT_SECRET: str = 'WFNOllvRvsNtOp1exzV9Iix3NYV9XuI7'
