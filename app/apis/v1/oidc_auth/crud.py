@@ -1,19 +1,15 @@
-
-from datetime import datetime, timedelta, UTC
-import random, uuid, json, secrets, jwt
+import random, uuid, json, secrets
 import requests
 from urllib.parse import quote
 
 from fastapi import status
 from fastapi.responses import JSONResponse
-from fastapi import HTTPException, Depends
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import HTTPException
 
 from app.core.config import Config
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
 
-from app.core.security import security
 from app.core.redis_client import redis_client
 
 from app.apis.v1.saml_auth.models import (
@@ -31,7 +27,8 @@ from app.apis.v1.utils import (
     get_cached_admin_token,
     add_user_to_group,
     get_user_info,
-    get_composite_roles
+    get_composite_roles,
+    create_token
 )
 
 
@@ -41,15 +38,6 @@ from app.apis.v1.oidc_auth.schemas import TokenRequest
 TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/token"
 AUTH_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/auth"
 REDIRECT_URI = f"{Config.FRONTEND_BASE_URL}/auth/callback"
-
-
-def create_token(sub:str, token_type: str = "access"):
-    payload = {
-        "sub": sub,
-        "sso_user": True,
-        "exp": datetime.now(UTC) + timedelta(hours=1) if token_type == "access" else datetime.now(UTC) + timedelta(days=30)
-    }
-    return jwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
 async def create_user_mapper(user_keycloak_uid, email, role_keycloak_uid, group_keycloak_uid, group_name, session: AsyncSession, first_name:str=None, last_name:str=None, invitation_token:str=None):
@@ -145,82 +133,7 @@ async def create_user_mapper(user_keycloak_uid, email, role_keycloak_uid, group_
             detail=f"Failed to process user: {str(e)}"
         )
     
-async def token_required(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """
-    Validate JWT token and return current user data from Redis session
-    """
-    try:
-        token = credentials.credentials
-        if not token:
-            raise HTTPException(
-                status_code=401,
-                detail="No token found"
-            )
-        # Verify JWT token
-        payload = jwt.decode(
-            token,
-            Config.SECRET_KEY,
-            algorithms=["HS256"]
-        )
-        # Validate required claims
-        if not payload.get("sub"):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid token: missing subject claim"
-            )
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token has expired"
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid token"
-        )
-    except Exception as e:
-        print(f"******* Exception IN TOKEN VALIDATION: {e} *******")
-        raise HTTPException(
-            status_code=401,
-            detail=str(e)
-        )
-        
-        
-async def get_refresh_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        token = credentials.credentials
-        if not token:
-            raise HTTPException(
-                status_code=401,
-                detail="No token found"
-            )
-        # Verify JWT token
-        payload = jwt.decode(
-            token,
-            Config.SECRET_KEY,
-            algorithms=["HS256"]
-        )
-        # Validate required claims
-        if not payload.get("sub"):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid token: missing subject claim"
-            )
-        return {
-            "token": token,
-            "sub": payload.get("sub"),
-        }
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token has expired"
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid refresh token"
-        )
+
         
 async def login_request(provider: str, invitation_token: str = None):
     """
@@ -446,7 +359,6 @@ async def me(current_user: dict, session: AsyncSession):
             json.dumps(session_data)
         )
 
-        print(f"******* Session Data From DB: {session_data} *******")  
         return JSONResponse({
             "status": "success",
             "data": session_data

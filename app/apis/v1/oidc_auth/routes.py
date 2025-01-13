@@ -2,15 +2,17 @@ from fastapi import APIRouter, Depends
 from sqlmodel.ext.asyncio.session import AsyncSession
 from app.db.session import get_session
 
+import requests
+
 from app.apis.v1.oidc_auth.crud import (
     login_request,
     callback_function,
-    token_required, 
     me, 
-    get_refresh_token, 
     initiate_refresh_token, 
     logout_user
 )
+
+from app.apis.v1.utils import token_required, get_refresh_token
 
 from app.apis.v1.oidc_auth.schemas import TokenResponse, TokenRequest
 
