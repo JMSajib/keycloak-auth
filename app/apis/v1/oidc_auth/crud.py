@@ -31,12 +31,14 @@ from app.apis.v1.utils import (
     create_token
 )
 
+import jwt
+
 
 from app.apis.v1.oidc_auth.schemas import TokenRequest
 
 
 TOKEN_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/token"
-AUTH_URL = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/auth"
+AUTH_URL = f"{Config.KEYCLOAK_EXTERNAL_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/auth"
 REDIRECT_URI = f"{Config.FRONTEND_BASE_URL}/auth/callback"
 
 
@@ -161,8 +163,7 @@ async def login_request(provider: str, invitation_token: str = None):
         "redirect_uri": REDIRECT_URI,
         "kc_idp_hint": provider,
         "state": state
-    }
-    
+    }    
     auth_url = f"{AUTH_URL}?{'&'.join(f'{k}={quote(v)}' for k, v in auth_params.items())}"
     return {"auth_url": auth_url}
 
@@ -170,8 +171,7 @@ async def login_request(provider: str, invitation_token: str = None):
         
 async def callback_function(request: TokenRequest, session: AsyncSession):
     print(f"************** CALLBACK CALLED ***************")
-    print(f"request: {request}")
-    print(f"code: {request.code}, session_state: {request.session_state}")
+    print(f"code: {request.code}, session_state: {request.session_state}, invitation_token: {request.state}")
     if not request.code or not request.session_state:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -179,7 +179,6 @@ async def callback_function(request: TokenRequest, session: AsyncSession):
         )
     if request.state:
         invitation_token = redis_client.get(f"invitation_code:{request.state}")
-        print(f"******* Invitation Token: {invitation_token} *******")
         redis_client.delete(f"invitation_code:{request.state}")
     
     code = request.code
@@ -194,6 +193,8 @@ async def callback_function(request: TokenRequest, session: AsyncSession):
         "session_state": session_state
     }
     
+    print(f"******* TOKEN URL: {TOKEN_URL} *******")
+    
     try:
         token_response = requests.post(TOKEN_URL, data=token_data)
         if token_response.status_code != 200:
@@ -203,7 +204,10 @@ async def callback_function(request: TokenRequest, session: AsyncSession):
             )
 
         tokens = token_response.json()
+        decoded_data = jwt.decode(tokens["access_token"], options={"verify_signature": False})
+        print(f"******* DECODED DATA: {decoded_data} *******")
         user_info = get_user_info(tokens["access_token"])
+        print(f"******* USER INFO: {user_info} *******")
         email = user_info.get('email')
         if not email:
             raise HTTPException(
@@ -225,15 +229,15 @@ async def callback_function(request: TokenRequest, session: AsyncSession):
         # Add user to group
         await add_user_to_group(keycloak_admin_token, user_info['sub'], group_id)
         
-        # Get owner role
-        roles = await get_roles(keycloak_admin_token, 'owner')
+        # Get Admin role
+        roles = await get_roles(keycloak_admin_token, 'Admin')
         if not roles:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"'{'owner'}' role not found in realm"
+                detail=f"'{'Admin'}' role not found in realm"
             )
         role_id = roles.get('id')
-        await assign_realm_role_to_user(keycloak_admin_token, user_info['sub'], role_id, 'owner')
+        await assign_realm_role_to_user(keycloak_admin_token, user_info['sub'], role_id, 'Admin')
         # create user mapper
         # user_id, email, dev_role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None,
         await create_user_mapper(user_info['sub'], email, role_id, group_id, group_name, session, user_info.get('first_name'), user_info.get('last_name'))

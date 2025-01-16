@@ -2,8 +2,6 @@ from fastapi import APIRouter, Depends
 from sqlmodel.ext.asyncio.session import AsyncSession
 from app.db.session import get_session
 
-import requests
-
 from app.apis.v1.oidc_auth.crud import (
     login_request,
     callback_function,
@@ -47,32 +45,4 @@ async def logout(current_user: dict = Depends(token_required), session: AsyncSes
 
 @auth_router.get("/alive")
 async def alive():
-    return {"message": "Hello, World!"}
-
-
-# async def exchange_token(token_data: dict):
-#     """
-#     Helper function to exchange tokens with Keycloak
-#     """
-#     try:
-#         token_response = requests.post(TOKEN_URL, data=token_data)
-#         if token_response.status_code == 200:
-#             tokens = token_response.json()
-#             user_info = get_user_info(tokens["access_token"])
-            
-#             return {
-#                 "success": True,
-#                 "access_token": tokens["access_token"],
-#                 "refresh_token": tokens["refresh_token"],
-#                 "user": user_info
-#             }
-#         else:
-#             raise HTTPException(
-#                 status_code=status.HTTP_401_UNAUTHORIZED,
-#                 detail="Token exchange failed"
-#             )
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail=str(e)
-#         )
+    return {"message": "Auth API is running"}

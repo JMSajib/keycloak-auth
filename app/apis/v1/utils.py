@@ -213,7 +213,7 @@ async def add_user_to_group(access_token: str, user_id: str, group_id: str):
     response.raise_for_status()
     
 
-async def get_roles(access_token, role_name="owner"):
+async def get_roles(access_token, role_name="Admin"):
     headers = {"Authorization": f"Bearer {access_token}"}
     roles_url = f"{Config.KEYCLOAK_URL}/admin/realms/{Config.KEYCLOAK_REALM}/roles"
     response = requests.get(roles_url, headers=headers)
@@ -244,10 +244,12 @@ def get_user_info(access_token: str) -> dict:
     Get user info from Keycloak using access token specifically for logout
     """
     try:
-        headers = {"Authorization": f"Bearer {access_token}"}
-        userinfo_url = f"{Config.KEYCLOAK_URL}/realms/{Config.KEYCLOAK_REALM}/protocol/openid-connect/userinfo"
-        
-        response = requests.get(userinfo_url, headers=headers)
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/json'
+        }        
+        print(f"******* USERINFO URL: {Config.USERINFO_URL} *******")
+        response = requests.get(Config.USERINFO_URL, headers=headers, verify=False)
         response.raise_for_status()  # This will raise an exception for 401 and other error status codes
         
         return response.json()

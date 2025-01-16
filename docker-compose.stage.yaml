@@ -1,0 +1,132 @@
+services:
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/nginx.conf:ro
+      - ./cloudflare.crt:/etc/nginx/ssl/cloudflare.crt:ro
+      - ./cloudflare.key:/etc/nginx/ssl/cloudflare.key:ro
+    depends_on:
+      - keycloak
+      - frontend
+      - api
+    networks:
+      - app_network
+      - keycloak_network
+  frontend:
+    image: jmsajib11/sso_frontend:0.0.1
+    container_name: react_frontend
+    networks:
+      - app_network
+      - keycloak_network
+    depends_on:
+      - api
+    restart: unless-stopped
+  api:
+    container_name: fastapi_app
+    image: jmsajib11/stage_auth:0.0.1
+    restart: unless-stopped
+    depends_on:
+      app_postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    networks:
+      - app_network
+      - keycloak_network
+    command: uvicorn run:app --host 0.0.0.0 --port 8000
+
+  app_postgres:
+    image: postgres:15
+    container_name: app_postgres
+    volumes:
+      - app_postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mysecretpassword
+      - POSTGRES_DB=auth_db
+    ports:
+      - "5432:5432"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7
+    container_name: app_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  keycloak_postgres:
+    image: postgres:15
+    container_name: keycloak_postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5433:5432"
+    volumes:
+      - keycloak_postgres_data:/var/lib/postgresql/data
+    networks:
+      - keycloak_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_postgres:5432/keycloak
+      KC_DB_USERNAME: postgres
+      KC_DB_PASSWORD: password123
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: "https://keycloak.jmsajib.com"
+      KC_HOSTNAME_PORT: 443
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_PROXY: edge
+      PROXY_ADDRESS_FORWARDING: "true"
+    ports:
+      - 8080:8080
+    command: start-dev
+    depends_on:
+      keycloak_postgres:
+        condition: service_healthy
+    networks:
+      - keycloak_network
+
+volumes:
+  app_postgres_data:
+    name: app_postgres_data
+  keycloak_postgres_data:
+    name: keycloak_postgres_data
+  redis_data:
+    name: app_redis_data
+
+networks:
+  app_network:
+    name: app_network
+  keycloak_network:
+    name: keycloak_network

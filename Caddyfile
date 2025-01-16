@@ -1,0 +1,45 @@
+{
+    admin off
+}
+
+jmsajib.com {
+    tls internal
+
+    log {
+        format console
+        level DEBUG
+    }
+
+    # API
+    handle /docs/* {
+        reverse_proxy api:8000
+    }
+
+    handle /api/v1* {
+        reverse_proxy api:8000
+    }
+
+    header {
+        # Security headers
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+    }
+}
+
+# Keycloak subdomain
+keycloak.jmsajib.com {
+    tls internal
+    
+    # Keycloak
+    handle /keycloak/* {
+        reverse_proxy keycloak:8080
+    }
+
+    header {
+        # Security headers
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+}
