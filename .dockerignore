@@ -8,6 +8,16 @@
 .gitignore
 .gitattributes
 
+cloudflare.crt
+cloudflare.key
+nginx.conf
+docker-compose.yml
+docker-compose.local.yml
+docker-compose.stage.yml
+
+Caddyfile
+Caddyfile.bak
+
 # Python
 __pycache__
 *.pyc

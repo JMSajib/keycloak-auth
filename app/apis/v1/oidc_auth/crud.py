@@ -240,7 +240,7 @@ async def callback_function(request: TokenRequest, session: AsyncSession):
         await assign_realm_role_to_user(keycloak_admin_token, user_info['sub'], role_id, 'Admin')
         # create user mapper
         # user_id, email, dev_role_id, group_id, group_name, session: AsyncSession, first_name:str=None, last_name:str=None,
-        await create_user_mapper(user_info['sub'], email, role_id, group_id, group_name, session, user_info.get('first_name'), user_info.get('last_name'))
+        await create_user_mapper(user_info['sub'], email, role_id, group_id, group_name, session, user_info.get('given_name'), user_info.get('family_name'))
         
         # Create tokens
         access_token = create_token(email, "access")
