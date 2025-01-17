@@ -409,12 +409,12 @@ async def logout_user(current_user: dict, session: AsyncSession):
     try:
         email = current_user.get("sub")
         token_data = redis_client.get(f"keycloak_tokens:{email}")
-        refresh_token = None
-        access_token = None
+        kyc_refresh_token = None
+        kyc_access_token = None
         if token_data:
             token_data = json.loads(token_data)
-            refresh_token = token_data.get("refresh_token")
-            access_token = token_data.get("access_token")
+            kyc_refresh_token = token_data.get("refresh_token")
+            kyc_access_token = token_data.get("access_token")
         else:
             pass
         
@@ -422,8 +422,12 @@ async def logout_user(current_user: dict, session: AsyncSession):
         logout_params = {
             'client_id': Config.KEYCLOAK_CLIENT_ID,
             'client_secret': Config.KEYCLOAK_CLIENT_SECRET,
-            'refresh_token': refresh_token  # Using access token here
+            'refresh_token': kyc_refresh_token  # Using access token here
         }
+        
+        if current_user.get("token"):
+            await add_to_blacklist(current_user.get("token"), session)
+        
         
         # End Keycloak session using the logout endpoint
         response = requests.post(

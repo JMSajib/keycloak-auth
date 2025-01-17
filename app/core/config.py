@@ -15,9 +15,10 @@ class Settings(BaseSettings):
     KEYCLOAK_CLIENT_SECRET: str
     KEYCLOAK_ADMIN_USERNAME: str = 'jmsajibcse@gmail.com'
     KEYCLOAK_ADMIN_PASSWORD: str = '@Pass12345'
+    KEYCLOAK_CLIENT_UID: str
     
     # Internal URLs (for service-to-service communication)
-    KEYCLOAK_INTERNAL_URL:str = "http://keycloak:8080"
+    KEYCLOAK_INTERNAL_URL:str = os.environ.get("KEYCLOAK_INTERNAL_URL", "http://keycloak:8080")
     KEYCLOAK_REALM:str = "sso-realm"
     
     # External URLs (for browser-to-keycloak communication)

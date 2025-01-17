@@ -39,7 +39,7 @@ async def user_info(current_user: dict = Depends(token_required), session: Async
 
 
 @auth_router.get('/logout')  # Changed to POST to match frontend expectations
-async def logout(current_user: dict = Depends(token_required), session: AsyncSession = Depends(get_session)):
+async def logout(current_user: dict = Depends(get_refresh_token), session: AsyncSession = Depends(get_session)):
     return await logout_user(current_user, session)
     
 

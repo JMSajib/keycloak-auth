@@ -13,3 +13,4 @@ python-multipart
 requests
 httpx
 python-dotenv
+typer[all]

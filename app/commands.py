@@ -4,6 +4,7 @@ import requests
 import json
 from enum import Enum
 from app.db.session import get_session
+from app.core.config import Config
 from app.apis.v1.saml_auth.models import Role
 
 from app.apis.v1.utils import get_keycloak_admin
@@ -185,8 +186,8 @@ ROLE_PERMISSIONS = {
 class Keycloak():
     def __init__(self):
         self.access_token = None  # Initialize as None
-        self.keycloak_url = "http://localhost:8080"
-        self.keycloak_client_id = "12bd07fe-8878-4239-85dd-fa3af3028c01"
+        self.keycloak_url = Config.KEYCLOAK_INTERNAL_URL
+        self.keycloak_client_id = Config.KEYCLOAK_CLIENT_UID
     
     async def initialize(self):
         self.access_token = await get_keycloak_admin()
