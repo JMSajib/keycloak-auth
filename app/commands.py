@@ -374,7 +374,7 @@ def store_realm_roles(environment: Environment):
     async def async_store_roles():
         keycloak = await Keycloak().initialize()
         realm_roles = keycloak.get_realm_level_roles()
-        async for db in get_session():
+        async with get_session() as db:
             try:   
                 roles = [
                     Role(
